@@ -1,0 +1,5 @@
+# ローカル専用の作業ルール・メモ(公開しない)
+CLAUDE.local.md
+
+# Python の生成キャッシュ
+__pycache__/
