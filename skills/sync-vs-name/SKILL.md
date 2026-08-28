@@ -47,3 +47,15 @@ Claude Code には名前が **3つ**あり、揃わない:
 なおスクリプトはファイル名の PID ではなく、JSON 内の `sessionId` で対象ファイルを探す。
 
 このスキルは会話タイトルを読んでセッション名に書き戻す。**打つ操作はゼロ。**
+
+## 効く範囲と限界（実測）
+
+- 書くのは `name` と **`nameSource: "user"`**（`/rename` が書く値と同じ）。
+  Remote Control や VSCode 拡張のブリッジ経由の `/list-agents` は「人が選んだ名前」以外を
+  伏せる（"not chosen by a human are withheld on this connection"）ので、`nameSource` が
+  無いと **"(unnamed session)"** と出る。以前の版は `nameSource` を消して書いていたため
+  これを踏んだ。この版は名前が一致していても `nameSource` が違えば書き直す
+- **効くもの**: 他セッションの `ListAgents` / `SendMessage` の宛先、`claude agents --json`
+- **効かないもの**: 動いているプロセス自身の `ListAgents` 1行目「This session is <名前>」。
+  これはメモリ上の値で、ファイルを直しても追随しない。**ここまで揃えたいときだけ
+  `/rename` を打つ**（人の操作）

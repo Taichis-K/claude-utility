@@ -16,8 +16,16 @@ SessionStart フックとしての実行でも同じ）。動機は、セッシ�
 
 実測で確認した事実（この実装の前提）:
 
-- セッション名は `~/.claude/sessions/<PID>.json` の `name` にあり、**外部プロセスから
-  書き換えた値がそのまま `/list-agents` に出る**
+- セッション名は `~/.claude/sessions/<PID>.json` の `name` にあり、**他セッションの
+  `ListAgents` と `claude agents --json` は外部プロセスが書き換えた値をそのまま読む**
+- **`nameSource` は `"user"` にする**（`/rename` が書く値。実測）。
+  Remote Control / VSCode 拡張のブリッジ経由の `/list-agents` は
+  「人が選んだ名前」以外を伏せる（"not chosen by a human are withheld on this
+  connection"）。その判定はこのキーで行われるらしく、`name` だけ直して `nameSource` を
+  消した状態では **"(unnamed session)" と表示された**。以前の実装（消す）はこれを踏んだ
+- **限界**: 動いているプロセス自身が出す「This session is <名前>」（自分の `ListAgents`
+  の1行目）はメモリ上の値で、ファイルを書き換えても追随しない（`/rename` でだけ変わる）。
+  他セッションからの到達と `claude agents --json` には効くので、用途はそこまで
 - 通信の同一性は隣の `<PID>.<hash>.key` 内の `peerToken` が担っており、
   **このスクリプトはそのファイルに触れない**＝名前を書き換えても通信は壊れない
 - 起動時に名前を渡す手段（`--name` / `CLAUDE_CODE_SESSION_NAME`）は
@@ -49,6 +57,10 @@ _PID_FILE_POLL_SEC = 0.1
 # 本体プロセスも同じファイルを read-modify-write する。書き負けたときに
 # 1度だけやり直す（それでも駄目なら黙らずに報告する）。
 _WRITE_ATTEMPTS = 2
+
+# `/rename` が書く nameSource の値（`~/.claude/sessions/<PID>.json` で実測）。
+# ブリッジ経由の `/list-agents` は、この値でない名前を「人が選んでいない」として伏せる
+_NAME_SOURCE_USER = "user"
 
 
 def read_hook_input() -> dict:
@@ -179,8 +191,11 @@ def apply_name(pid_file: Path, title: str, now_ms: int) -> tuple[str, str | None
     結果は ``"unchanged"`` / ``"updated"`` / ``"lost"`` / ``"failed"``。
 
     - **他のキーを落とさない**（本体プロセスが書いた `peerFeatures` 等がある）
-    - `nameSource` は**消す**。残っている `"derived"` / `"auto"` は
-      「自動生成なので衝突時に譲ってよい」印で、人が付けた名前には付かない
+    - `nameSource` は **`"user"` にする**（`/rename` が書く値）。`"derived"` は
+      「cwd から自動生成」の印で、これが付いた（または `nameSource` が無い）名前は
+      ブリッジ経由の `/list-agents` で "(unnamed session)" と伏せられる
+    - `name` が既に一致していても `nameSource` が `"user"` でなければ書き直す
+      （旧実装が `nameSource` を消して書いたファイルを、この版で直せるように）
     - 書いたあと**読み直して確かめる**。本体プロセスも同じファイルを
       read-modify-write するので、書き負けがありうる（`"lost"`）
     """
@@ -193,12 +208,12 @@ def apply_name(pid_file: Path, title: str, now_ms: int) -> tuple[str, str | None
         if not isinstance(current, dict):
             return "failed", None
         last_seen = current.get("name") if isinstance(current.get("name"), str) else None
-        if last_seen == title:
+        if last_seen == title and current.get("nameSource") == _NAME_SOURCE_USER:
             return "unchanged", last_seen
 
         payload = dict(current)
         payload["name"] = title
-        payload.pop("nameSource", None)
+        payload["nameSource"] = _NAME_SOURCE_USER
         payload["nameSince"] = now_ms
         payload["updatedAt"] = now_ms
         try:
@@ -212,7 +227,8 @@ def apply_name(pid_file: Path, title: str, now_ms: int) -> tuple[str, str | None
             return "failed", last_seen
         actual = after.get("name") if isinstance(after, dict) else None
         last_seen = actual if isinstance(actual, str) else None
-        if last_seen == title:
+        source_ok = isinstance(after, dict) and after.get("nameSource") == _NAME_SOURCE_USER
+        if last_seen == title and source_ok:
             return "updated", last_seen
     return "lost", last_seen
 
