@@ -9,10 +9,14 @@ allowed-tools: Bash
 同じディレクトリの `session_name_sync.py` を呼ぶだけ。**自分で名前を組み立てたり、
 `~/.claude/sessions/*.json` を直接編集したりしないこと。**
 
+1. まず `ListAgents` ツールを呼び、1 行目「This session is **<名前>** [ref]」の名前を取る
+   （実行中プロセスがメモリ上で持つ自分の名前。ファイルには無いので、これだけは呼び出し側が渡す）
+2. その名前を `--memory-name` に渡してスクリプトを実行する
+
 ```bash
 s=.claude/skills/sync-vs-name/session_name_sync.py
 [ -f "$s" ] || s=~/.claude/skills/sync-vs-name/session_name_sync.py
-python "$s" </dev/null 2>/dev/null || python3 "$s" </dev/null
+python "$s" --memory-name "<1 行目の名前>" </dev/null 2>/dev/null || python3 "$s" --memory-name "<1 行目の名前>" </dev/null
 ```
 
 プロジェクト(`.claude/skills/`)にあればそちらを、無ければユーザー(`~/.claude/skills/`)のものを使う。
@@ -22,13 +26,30 @@ python "$s" </dev/null 2>/dev/null || python3 "$s" </dev/null
 
 ## 出力の読み方
 
-| 出力 | 意味 | 次にやること |
-|---|---|---|
-| （何も出ない） | 同期の必要が無いか、対象を特定できなかった（既に一致 ／ 会話に名前が付いていない ／ セッション情報ファイルが見つからない・複数あって絞れない） | 名前を付けていなければ `/rename <名前>` してから再実行。付けているのに何も出ないなら、特定できなかった可能性をユーザーに伝える |
-| `SESSION_NAME_SYNCED …` | 同期できた | `/list-agents` で確認できる |
-| `SESSION_NAME_NOT_SYNCED …` | できなかった | 出力の理由をそのままユーザーに伝える |
+出力は常に固定フォーマット（1 行目が結果、以降が現状。値が無い項目は `-`）:
 
-結果はユーザーに**1行で**報告する。同期できたなら新しいセッション名を含める。
+```
+SESSION_NAME_<結果> <理由>
+  title : '<会話タイトル>'   (conversation title, set by /rename)
+  name  : '<セッション名>'   (session name shown in /list-agents)
+  source: 'user'            (must be 'user' to be visible to other sessions)
+  file  : <セッション情報ファイル>
+  memory: '<メモリ上の名前>'      (name the running process calls itself; changes only via /rename or restart)
+```
+
+`memory` は `--memory-name` で渡した値をそのまま表示する（書き込まない）。
+`file` の name と違っていても正常: 他セッションからは `name` で届き、プロセス自身は `memory` を名乗る。
+
+| 1 行目 | 意味 | 次にやること |
+|---|---|---|
+| `SESSION_NAME_SYNCED` | 同期できた | `/list-agents` で確認できる |
+| `SESSION_NAME_UNCHANGED` | 既に一致している | なし |
+| `SESSION_NAME_INFO` | 会話に名前が付いていない | 変えたいなら `/rename <名前>` してから再実行 |
+| `SESSION_NAME_NOT_SYNCED` | できなかった | 1 行目の理由をそのまま伝える |
+| `SESSION_NAME_UNKNOWN` | 対象を特定できなかった（transcript かセッション情報ファイルが見つからない・複数あって絞れない） | その旨を伝える |
+
+**出力ブロックをそのまま（要約・言い換えせず）ユーザーに見せる。**
+ツール結果はリモート（Remote Control）からは見えないため、再掲が必要。
 
 ## なぜ要るのか
 

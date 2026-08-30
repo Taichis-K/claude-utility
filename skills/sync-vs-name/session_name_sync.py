@@ -233,25 +233,49 @@ def apply_name(pid_file: Path, title: str, now_ms: int) -> tuple[str, str | None
     return "lost", last_seen
 
 
-def format_updated(title: str) -> str:
+def _read_state(pid_file: Path) -> tuple[str | None, str | None]:
+    """pid ファイルの ``(name, nameSource)`` を返す。読めなければ ``(None, None)``。"""
+    try:
+        obj = json.loads(pid_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None, None
+    if not isinstance(obj, dict):
+        return None, None
+    name = obj.get("name")
+    source = obj.get("nameSource")
     return (
-        f"SESSION_NAME_SYNCED session name now matches the conversation "
-        f"title {title!r} (the name shown in /list-agents)."
+        name if isinstance(name, str) else None,
+        source if isinstance(source, str) else None,
     )
 
 
-def format_lost(title: str, actual: str | None) -> str:
-    return (
-        f"SESSION_NAME_NOT_SYNCED could not set the session name to {title!r} "
-        f"(it was reverted to {actual!r} right after writing). Other sessions will "
-        "reach this session by that name, not by the conversation title."
-    )
+def format_status(
+    result: str,
+    note: str,
+    title: str | None,
+    name: str | None,
+    source: str | None,
+    pid_file: Path | None,
+    memory: str | None = None,
+) -> str:
+    """固定フォーマットで現状を出す。1 行目が結果、以降が状態（値が無いものは ``-``）。
 
+    ``memory`` は実行中プロセスがメモリ上で持つ自分の名前（``ListAgents`` の
+    「This session is <名前>」）。ファイルからは取れないので呼び出し側が渡す。表示のみ。
+    """
 
-def format_failed() -> str:
-    return (
-        "SESSION_NAME_NOT_SYNCED failed to sync the session name "
-        "(cannot read/write the session info file)."
+    def q(value: str | None) -> str:
+        return repr(value) if value is not None else "-"
+
+    return "\n".join(
+        [
+            f"SESSION_NAME_{result} {note}",
+            f"  title : {q(title)}  (conversation title, set by /rename)",
+            f"  name  : {q(name)}  (session name shown in /list-agents)",
+            f"  source: {q(source)}  (must be 'user' to be visible to other sessions)",
+            f"  file  : {pid_file if pid_file is not None else '-'}",
+            f"  memory: {q(memory)}  (name the running process calls itself; changes only via /rename or restart)",
+        ]
     )
 
 
@@ -262,34 +286,61 @@ def sync(
     now_ms: int,
     dry_run: bool = False,
     waiter=wait_for_pid_file,
+    memory_name: str | None = None,
 ) -> tuple[str, str | None]:
     """同期を1回試みる。``(結果, メッセージ)`` を返す。
 
-    結果 ``"no_title"`` / ``"no_pid_file"`` / ``"no_transcript"`` は
-    **黙って終わる**（名前を付けていない・対象ファイルがまだ無い・候補が複数で
-    絞れない、のいずれか。SKILL.md の「何も出ない」に対応する）。
+    どの結果でも**固定フォーマットで現状を出力する**（1 行目が ``SESSION_NAME_<結果>``、
+    以降に title / name / source / file）。黙って終わることは無い。
     """
+
+    def _status(*args, **kwargs) -> str:
+        return format_status(*args, memory=memory_name, **kwargs)
+
     transcript = find_transcript(projects_dir, session_id)
     if transcript is None:
-        return "no_transcript", None
+        return "no_transcript", _status(
+            "UNKNOWN", "transcript not found or ambiguous", None, None, None, None
+        )
     title = read_last_custom_title(transcript)
     if title is None:
-        return "no_title", None
+        # 会話に名前が付いていなくても、現在のセッション名は報告する
+        pid_file = find_pid_file(sessions_dir, session_id)
+        name, source = _read_state(pid_file) if pid_file is not None else (None, None)
+        return "no_title", _status(
+            "INFO", "no conversation title set (run /rename <name>, then rerun)",
+            None, name, source, pid_file,
+        )
 
     pid_file = waiter(sessions_dir, session_id)
     if pid_file is None:
-        return "no_pid_file", None
+        return "no_pid_file", _status(
+            "UNKNOWN", "session info file not found or ambiguous", title, None, None, None
+        )
     if dry_run:
-        return "dry_run", f"{pid_file} <- {title!r}"
+        name, source = _read_state(pid_file)
+        return "dry_run", _status(
+            "DRY_RUN", "would write the conversation title as the session name",
+            title, name, source, pid_file,
+        )
 
-    outcome, actual = apply_name(pid_file, title, now_ms)
+    outcome, _ = apply_name(pid_file, title, now_ms)
+    name, source = _read_state(pid_file)
     if outcome == "updated":
-        return outcome, format_updated(title)
+        return outcome, _status(
+            "SYNCED", "session name updated to match the conversation title",
+            title, name, source, pid_file,
+        )
     if outcome == "unchanged":
-        return outcome, None
+        return outcome, _status("UNCHANGED", "already in sync", title, name, source, pid_file)
     if outcome == "lost":
-        return outcome, format_lost(title, actual)
-    return "failed", format_failed()
+        return outcome, _status(
+            "NOT_SYNCED", "write was reverted right after writing; other sessions see the name below",
+            title, name, source, pid_file,
+        )
+    return "failed", _status(
+        "NOT_SYNCED", "cannot read/write the session info file", title, name, source, pid_file
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -297,6 +348,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--session-id", help="stdin/環境変数の代わりに使う")
     parser.add_argument(
         "--dry-run", action="store_true", help="書き換えず、対象と名前だけ出す"
+    )
+    parser.add_argument(
+        "--memory-name",
+        help="実行中プロセスがメモリ上で持つ自分の名前（ListAgents の This session is <名前>）。表示のみで書き込まない",
     )
     args = parser.parse_args(argv)
 
@@ -324,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
             sessions_dir=sessions_dir,
             now_ms=int(time.time() * 1000),
             dry_run=args.dry_run,
+            memory_name=args.memory_name,
         )
     except Exception as exc:  # noqa: BLE001 — フックでセッション起動を止めない
         print(f"SESSION_NAME_NOT_SYNCED unexpected failure: {exc!r}", flush=True)
