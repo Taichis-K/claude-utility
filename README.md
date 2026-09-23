@@ -1,19 +1,17 @@
 # claude-utility
 
 Claude Code の共通資産(コマンド・スクリプト・スキル)を複数 PC で共有するために履歴管理するリポジトリ。
-実体は `~/.claude` にあり、[sync.sh](sync.sh) でリポジトリと双方向に同期する
-(CLAUDE.md だけはこのリポジトリの作業ルールで、同期対象外)。
-同期スクリプトは Windows(Git Bash)と macOS の両方で動作する。
+使うときは、必要な機能だけを [docs/SETUP.md](docs/SETUP.md) の手順で `~/.claude` に取り込む。
 
 ## 構成
 
 | パス | 内容 |
 |---|---|
-| `CLAUDE.md` | このリポジトリの作業ルール(公開・コミット前チェックルール)。`~/.claude` とは同期しない |
+| `CLAUDE.md` | このリポジトリの作業ルール(公開・コミット前チェックルール)。取り込み対象ではない |
 | `commands/` | スラッシュコマンド(例: `/open-claude`) |
 | `scripts/` | コマンドから呼ばれる補助スクリプト(例: `open-claude.ps1` / `open-claude.sh`) |
 | `skills/` | スキル(例: `grill-me`、`context-layering`、`context-declutter`、`sync-vs-name`) |
-| `sync.sh` | `~/.claude` との同期スクリプト(Windows は Git Bash で実行) |
+| `docs/` | 機能ごとの取り込み手順([SETUP.md](docs/SETUP.md)) |
 
 認証情報・履歴・セッションなどのマシン固有データはリポジトリに含めない。
 
@@ -49,43 +47,20 @@ AI が探索で読みにいく範囲から読む必要のないものを外し�
 
 - [skills/context-declutter/SKILL.md](skills/context-declutter/SKILL.md)
 
-### `sync-vs-name`(スキル)
+### `sync-vs-name`(スキル + フック)
 
 セッション名(`/list-agents` に出る名前)は、VSCode を開き直すと自動生成の名前に戻ってしまう。
 このスキルは、セッション名を会話タイトル(VSCode のタブに出ている名前)に合わせ直す。
 
 - [skills/sync-vs-name/SKILL.md](skills/sync-vs-name/SKILL.md)
+- [docs/SETUP.md](docs/SETUP.md#sync-vs-name) — 再開時に自動で同期・報告させる設定(フック登録)
 
 ## 使い方
 
-Windows では Git Bash、macOS ではターミナルから実行する。
+必要な機能だけを選んで `~/.claude` に取り込む。機能ごとに、置くファイル・追加の設定・確かめ方を
+[docs/SETUP.md](docs/SETUP.md) にまとめてある。AI に「SETUP.md の ○○ を入れて」と頼めばよい。
 
-```bash
-./sync.sh diff        # ローカル(~/.claude)との差分を表示(変更なし)
-./sync.sh from-local  # ~/.claude → リポジトリへ収集(git diff で確認してコミット)
-./sync.sh to-local    # リポジトリ → ~/.claude へ反映(事前に ~/.claude/backups へ退避)
-```
+### 更新するとき
 
-### ローカルの変更をコミットする
-
-```bash
-./sync.sh from-local
-git diff              # 内容を確認
-git add -A && git commit -m "変更内容" && git push
-```
-
-### 別の PC でセットアップする
-
-```bash
-git clone https://github.com/Taichis-K/claude-utility.git
-cd claude-utility
-./sync.sh diff        # 上書きされる内容を確認
-./sync.sh to-local
-```
-
-`to-local` は反映前に既存ファイル一式を `~/.claude/backups/sync-<日時>/` へ退避するので、
-誤って上書きしても戻せる。
-
-## 対象を増やすとき
-
-`sync.sh` 冒頭の `DIRS` に追加する。
+`~/.claude` 側で直したら、[docs/SETUP.md](docs/SETUP.md) の対応表を見てリポジトリの同じパスへ書き戻し、コミットする。
+ファイルを増やしたり減らしたりしたら、SETUP.md の対応表も直す。
