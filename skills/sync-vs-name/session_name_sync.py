@@ -54,13 +54,26 @@ from pathlib import Path
 _PID_FILE_WAIT_SEC = 2.0
 _PID_FILE_POLL_SEC = 0.1
 
-# 本体プロセスも同じファイルを read-modify-write する。書き負けたときに
-# 1度だけやり直す（それでも駄目なら黙らずに報告する）。
-_WRITE_ATTEMPTS = 2
+# 本体プロセスも同じファイルを read-modify-write する。VSCode を開き直して複数の
+# セッションが同時に resume すると、本体がファイルを開いている瞬間に当たり、Windows では
+# os.replace が PermissionError、read が途中書き込みの不正 JSON になる（実測: 2026-09-23）。
+# どちらも一瞬なので、短い間隔で数回やり直す（合計でもフックの timeout より十分短い）。
+_WRITE_ATTEMPTS = 6
+_WRITE_RETRY_SEC = 0.25
 
 # `/rename` が書く nameSource の値（`~/.claude/sessions/<PID>.json` で実測）。
 # ブリッジ経由の `/list-agents` は、この値でない名前を「人が選んでいない」として伏せる
 _NAME_SOURCE_USER = "user"
+
+# 結果ログ（~/.claude/logs/sync-vs-name.log）の上限。超えたら 1 世代だけ残して始め直す
+_LOG_MAX_BYTES = 256 * 1024
+
+# initialUserMessage で Claude に報告させる source。報告は毎回 1 往復ぶんのトークンを使う。
+# initialUserMessage は startup / resume / clear でだけ効き compact では無視される
+# （公式 docs では確認できず、2026-09-23 に実測。Nekochans の SessionStart フックでも使用中）
+_REPORT_SOURCES = ("resume", "clear")
+# これが設定されていれば報告させない（入れ子の `claude -p` などでも SessionStart フックは走るため）
+_QUIET_ENV = "SYNC_VS_NAME_QUIET"
 
 
 def read_hook_input() -> dict:
@@ -170,27 +183,45 @@ def wait_for_pid_file(
         sleep(poll_sec)
 
 
-def _write_atomic(path: Path, payload: dict) -> None:
-    """同じディレクトリに一時ファイルを作って `os.replace` で差し替える。"""
+def _write_json(path: Path, payload: dict) -> None:
+    """同じディレクトリに一時ファイルを作って `os.replace` で差し替える。
+
+    Windows では、相手プロセス（Claude 本体）がそのファイルを開いている間は
+    `os.replace` が PermissionError になる（実測）。同じ瞬間でも**同じファイルへの
+    上書き**は通るので、その場合だけ直接書く。
+
+    直接書きは原子的でなく、書いている一瞬は本体から空や途中の JSON が見えうる。
+    先に文字列化して 1 回の write で済ませ、その窓を最小にする（書いた後は
+    ``apply_name`` が読み直して確かめる）。
+    """
+    text = json.dumps(payload)
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-        os.replace(tmp_name, path)
-    except BaseException:
+            handle.write(text)
+        try:
+            os.replace(tmp_name, path)
+            return
+        except PermissionError:
+            pass
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+    finally:
         try:
             os.unlink(tmp_name)
         except OSError:
             pass
-        raise
 
 
-def apply_name(pid_file: Path, title: str, now_ms: int) -> tuple[str, str | None]:
-    """pid ファイルの `name` を `title` にする。``(結果, 実際の name)`` を返す。
+def apply_name(
+    pid_file: Path, title: str, now_ms: int, sleep=time.sleep
+) -> tuple[str, str | None, str | None]:
+    """pid ファイルの `name` を `title` にする。``(結果, 実際の name, 最後のエラー)`` を返す。
 
     結果は ``"unchanged"`` / ``"updated"`` / ``"lost"`` / ``"failed"``。
 
-    - **他のキーを落とさない**（本体プロセスが書いた `peerFeatures` 等がある）
+    - **他のキーを落とさない**（本体プロセスが書いた `peerFeatures` 等がある）。ただし読んでから
+      書くまでの間に本体が他のキーを書き換えると、その変更を古い値で巻き戻しうる（構造上避けられない）
     - `nameSource` は **`"user"` にする**（`/rename` が書く値）。`"derived"` は
       「cwd から自動生成」の印で、これが付いた（または `nameSource` が無い）名前は
       ブリッジ経由の `/list-agents` で "(unnamed session)" と伏せられる
@@ -198,18 +229,27 @@ def apply_name(pid_file: Path, title: str, now_ms: int) -> tuple[str, str | None
       （旧実装が `nameSource` を消して書いたファイルを、この版で直せるように）
     - 書いたあと**読み直して確かめる**。本体プロセスも同じファイルを
       read-modify-write するので、書き負けがありうる（`"lost"`）
+    - 読み書きの OSError と読み取りの不正 JSON は、本体が書いている最中に当たった
+      一瞬の状態として扱い、少し待ってやり直す。回数を使い切ったら ``"failed"``
+      （``"lost"`` は、読み書き自体は通ったのに毎回書き負けた場合）
     """
     last_seen: str | None = None
-    for _ in range(_WRITE_ATTEMPTS):
+    last_error: str | None = None
+    wrote = False  # 一度でも書き込みが通ったか（読み直し失敗の後に自分の値を読んで unchanged と誤報しない）
+    for attempt in range(_WRITE_ATTEMPTS):
+        if attempt:
+            sleep(_WRITE_RETRY_SEC)
         try:
             current = json.loads(pid_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            return "failed", None
+        except (OSError, ValueError, TypeError) as exc:
+            last_error = repr(exc)
+            continue
         if not isinstance(current, dict):
-            return "failed", None
+            last_error = "session info file is not a JSON object"
+            continue
         last_seen = current.get("name") if isinstance(current.get("name"), str) else None
         if last_seen == title and current.get("nameSource") == _NAME_SOURCE_USER:
-            return "unchanged", last_seen
+            return ("updated" if wrote else "unchanged"), last_seen, None
 
         payload = dict(current)
         payload["name"] = title
@@ -217,20 +257,26 @@ def apply_name(pid_file: Path, title: str, now_ms: int) -> tuple[str, str | None
         payload["nameSince"] = now_ms
         payload["updatedAt"] = now_ms
         try:
-            _write_atomic(pid_file, payload)
-        except OSError:
-            return "failed", last_seen
+            _write_json(pid_file, payload)
+        except OSError as exc:
+            last_error = repr(exc)
+            continue
+        wrote = True
 
         try:
             after = json.loads(pid_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            return "failed", last_seen
+        except (OSError, ValueError, TypeError) as exc:
+            last_error = repr(exc)
+            continue
         actual = after.get("name") if isinstance(after, dict) else None
         last_seen = actual if isinstance(actual, str) else None
         source_ok = isinstance(after, dict) and after.get("nameSource") == _NAME_SOURCE_USER
         if last_seen == title and source_ok:
-            return "updated", last_seen
-    return "lost", last_seen
+            return "updated", last_seen, None
+        last_error = None
+    if last_error is not None:
+        return "failed", last_seen, last_error
+    return "lost", last_seen, None
 
 
 def _read_state(pid_file: Path) -> tuple[str | None, str | None]:
@@ -290,8 +336,9 @@ def sync(
 ) -> tuple[str, str | None]:
     """同期を1回試みる。``(結果, メッセージ)`` を返す。
 
-    どの結果でも**固定フォーマットで現状を出力する**（1 行目が ``SESSION_NAME_<結果>``、
-    以降に title / name / source / file）。黙って終わることは無い。
+    どの結果でも**固定フォーマットのメッセージを返す**（1 行目が ``SESSION_NAME_<結果>``、
+    以降に title / name / source / file / memory）。出すかどうかは ``main`` が決める
+    （SessionStart の ``startup`` で同期対象が無いときだけ出さない）。
     """
 
     def _status(*args, **kwargs) -> str:
@@ -324,7 +371,7 @@ def sync(
             title, name, source, pid_file,
         )
 
-    outcome, _ = apply_name(pid_file, title, now_ms)
+    outcome, _, error = apply_name(pid_file, title, now_ms)
     name, source = _read_state(pid_file)
     if outcome == "updated":
         return outcome, _status(
@@ -338,8 +385,11 @@ def sync(
             "NOT_SYNCED", "write was reverted right after writing; other sessions see the name below",
             title, name, source, pid_file,
         )
+    detail = f": {error}" if error else ""
     return "failed", _status(
-        "NOT_SYNCED", "cannot read/write the session info file", title, name, source, pid_file
+        "NOT_SYNCED",
+        f"cannot read/write the session info file{detail}",
+        title, name, source, pid_file,
     )
 
 
@@ -373,7 +423,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     try:
-        _, message = sync(
+        result, message = sync(
             session_id=session_id,
             projects_dir=projects_dir,
             sessions_dir=sessions_dir,
@@ -382,12 +432,110 @@ def main(argv: list[str] | None = None) -> int:
             memory_name=args.memory_name,
         )
     except Exception as exc:  # noqa: BLE001 — フックでセッション起動を止めない
-        print(f"SESSION_NAME_NOT_SYNCED unexpected failure: {exc!r}", flush=True)
+        # 想定外の失敗も通常の結果と同じ経路（ログ・フック時は JSON）で出す
+        result, message = "failed", f"SESSION_NAME_NOT_SYNCED unexpected failure: {exc!r}"
+
+    _append_log(message, hook_input.get("source"), session_id)
+
+    # 新規セッションの起動（source: startup）では transcript も会話タイトルもまだ無い。
+    # 同期するものが無いだけなので、毎回「UNKNOWN」を会話に流し込まない（ログには残す）
+    if hook_input.get("source") == "startup" and result in ("no_transcript", "no_title"):
         return 0
 
-    if message:
+    if hook_input.get("hook_event_name") == "SessionStart":
+        # フックの素の stdout は Claude のコンテキストに入るだけで人の画面に出ない。
+        # JSON で返し、systemMessage（画面表示）に 1 行要約、additionalContext に全文を入れる
+        specific = {"hookEventName": "SessionStart", "additionalContext": message}
+        # VSCode 拡張は systemMessage を画面に出さず、additionalContext だけではモデルも動かない。
+        # resume / clear では毎回 initialUserMessage を付けて Claude に報告させる
+        # （ユーザーが打ったものとして処理される。startup・compact では出さない／効かない）
+        if hook_input.get("source") in _REPORT_SOURCES and not env.get(_QUIET_ENV):
+            specific["initialUserMessage"] = _report_request(message)
+        print(
+            json.dumps(
+                {
+                    "systemMessage": _summary_line(message, hook_input.get("source")),
+                    "hookSpecificOutput": specific,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    else:
         print(message, flush=True)
     return 0
+
+
+def _report_request(message: str) -> str:
+    """resume / clear 直後に Claude へ渡す定型の依頼文。"""
+    # memory 行はフックからは取れない（プロセスのメモリ上の値）ので、Claude に埋めさせる
+    block = "\n".join(
+        line.replace("memory: -", "memory: '<ListAgents の名前>'", 1)
+        if line.strip().startswith("memory:")
+        else line
+        for line in message.splitlines()
+    )
+    return (
+        "【sync-vs-name の定型報告（セッション再開時に自動で送られたメッセージ）】\n"
+        "ListAgents ツールを呼び、1 行目「This session is <名前>」の名前で下のブロックの "
+        "<ListAgents の名前> を置き換え、ブロック全体をコードブロックでそのまま"
+        "（要約・言い換えせず）報告してください:\n\n"
+        f"{block}\n\n"
+        "報告が済んだら止まってください。他の作業は始めないでください。"
+    )
+
+
+_SUMMARY_JA = {
+    "SESSION_NAME_SYNCED": "同期しました",
+    "SESSION_NAME_UNCHANGED": "既に一致",
+    "SESSION_NAME_INFO": "会話タイトル未設定（/rename で付けてください）",
+    "SESSION_NAME_NOT_SYNCED": "失敗",
+    "SESSION_NAME_UNKNOWN": "対象を特定できず",
+    "SESSION_NAME_DRY_RUN": "dry-run",
+}
+
+
+def _summary_line(message: str, source: str | None) -> str:
+    """画面に出す 1 行。例: ``sync-vs-name (resume): 同期しました → 'ClaudeCodeTest'``"""
+    first = message.splitlines()[0]
+    code = first.split(" ", 1)[0]
+    text = _SUMMARY_JA.get(code, code)
+    name = None
+    for line in message.splitlines()[1:]:
+        if line.strip().startswith("name  :"):
+            name = line.split(":", 1)[1].split("(", 1)[0].strip()
+    line = f"sync-vs-name ({source or '-'}): {text}"
+    if name and name != "-":
+        line += f" → {name}"
+    if code == "SESSION_NAME_NOT_SYNCED":
+        line += f" [{first.split(' ', 1)[1] if ' ' in first else ''}]"
+    return line
+
+
+def _append_log(message: str, source: str | None, session_id: str) -> None:
+    """``~/.claude/logs/sync-vs-name.log`` に 1 行追記する。失敗しても黙って続ける。
+
+    ``_LOG_MAX_BYTES`` を超えたら ``.log.1`` に退避して（1 世代だけ）新しく始める。
+    """
+    try:
+        log_dir = Path.home() / ".claude" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "sync-vs-name.log"
+        try:
+            if log_file.stat().st_size > _LOG_MAX_BYTES:
+                # 複数セッションが同時に超過を見ても二重に退避しないよう、先に自分専用の名前へ
+                # 移して「確保」する。確保できるのは 1 プロセスだけで、負けた側は OSError で抜ける
+                claimed = log_file.with_name(f"{log_file.name}.{os.getpid()}.rotating")
+                os.replace(log_file, claimed)
+                os.replace(claimed, log_file.with_name(log_file.name + ".1"))
+        except OSError:
+            pass
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        first = message.splitlines()[0]
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.write(f"{stamp}\t{source or 'manual'}\t{session_id}\t{first}\n")
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

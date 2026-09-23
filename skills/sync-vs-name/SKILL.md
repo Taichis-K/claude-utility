@@ -80,3 +80,52 @@ Claude Code には名前が **3つ**あり、揃わない:
 - **効かないもの**: 動いているプロセス自身の `ListAgents` 1行目「This session is <名前>」。
   これはメモリ上の値で、ファイルを直しても追随しない。**ここまで揃えたいときだけ
   `/rename` を打つ**（人の操作）
+- **本体との書き込み競合**（2026-09-23 実測）: VSCode を開き直して複数セッションが同時に
+  resume すると、本体がセッション情報ファイルを開いている瞬間に当たる。Windows ではその間
+  `os.replace` が PermissionError になり、旧版は即 `NOT_SYNCED cannot read/write` で諦めていた。
+  現版は読み書きの失敗を最大 6 回（0.25 秒間隔）やり直し、`os.replace` が拒否されたときは
+  同じファイルへの上書きに切り替える。`NOT_SYNCED` の 1 行目には最後のエラーが付く
+- **SessionStart フックの `startup`**（新規セッション）では transcript も会話タイトルもまだ
+  無いので、スクリプトは何も出力しない（以前は毎回 `SESSION_NAME_UNKNOWN` が会話に流れていた）。
+  `resume` / `clear` / `compact` では従来どおり結果を出す
+
+## SessionStart フックとしての登録と出力
+
+`~/.claude/settings.json` に登録して、起動・resume・clear・compact のたびに自動で同期する
+（手順と、結果を VSCode で表示させる設定はリポジトリの `docs/SETUP.md`）:
+
+```json
+"hooks": {
+  "SessionStart": [
+    {
+      "matcher": "startup|resume|clear|compact",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python \"$HOME/.claude/skills/sync-vs-name/session_name_sync.py\"",
+          "timeout": 10,
+          "statusMessage": "セッション名を会話タイトルに同期"
+        }
+      ]
+    }
+  ]
+}
+```
+
+- stdin の `hook_event_name` が `SessionStart` のときは **JSON で返す**:
+  `systemMessage` に 1 行の日本語要約（例: `sync-vs-name (resume): 同期しました → 'ClaudeCodeTest'`）、
+  `hookSpecificOutput.additionalContext` に上の固定フォーマット全文。手動実行はテキストのまま
+- **VSCode 拡張は SessionStart の `systemMessage` を画面に出さない**（2026-09-23 実測）。
+  `additionalContext` だけではモデルも動かないので、ユーザーが打つまで何も表示されない
+- そこで `resume` / `clear` では**毎回** `hookSpecificOutput.initialUserMessage` に定型の依頼文を入れる。
+  Claude はそれをユーザーが打ったメッセージとして処理し、ListAgents を呼んで `memory` 行を埋めた
+  固定フォーマットのブロックを報告して止まる（1 往復ぶんのトークンを使う）。
+  `initialUserMessage` は `startup` / `resume` / `clear` でだけ効き、`compact` では無視される
+  （公式 docs では確認できていない。2026-09-23 に resume で実測、別プロジェクトの SessionStart フックでも使用中）。
+  `startup` では出さない（開いただけでモデルを動かさない）
+- 環境変数 `SYNC_VS_NAME_QUIET` が設定されていれば `initialUserMessage` を出さない
+  （入れ子の `claude -p` でも SessionStart フックは走るため。呼ぶ側が設定する）
+- 実行のたびに `~/.claude/logs/sync-vs-name.log` へ 1 行追記する
+  （`時刻<TAB>source(startup/resume/clear/compact/manual)<TAB>session_id<TAB>結果の1行目`）。
+  startup の無出力分もここには残る。256 KB を超えたら `sync-vs-name.log.1` に退避して
+  新しく始める（1 世代だけ）
