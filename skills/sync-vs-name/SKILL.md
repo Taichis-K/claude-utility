@@ -112,6 +112,9 @@ Claude Code には名前が **3つ**あり、揃わない:
 }
 ```
 
+- コマンドの `python` は、`python` が無い環境（Homebrew の Python だけを入れた macOS など）では
+  `python3` にする。フックはフォールバック付きの 1 行ではなく単一コマンドなので、
+  無い方を書くと黙って動かない（手動実行の例と違って `||` が使えない）
 - stdin の `hook_event_name` が `SessionStart` のときは **JSON で返す**:
   `systemMessage` に 1 行の日本語要約（例: `sync-vs-name (resume): 同期しました → 'ClaudeCodeTest'`）、
   `hookSpecificOutput.additionalContext` に上の固定フォーマット全文。手動実行はテキストのまま
