@@ -6,6 +6,10 @@ allowed-tools: Bash
 
 # 会話タイトルをセッション名に同期する
 
+> Claude Code 2.1.309 以降は、本体が VSCode の開き直し後や `/clear` 後も `/rename` した名前を
+> 自動で戻す（2026-10-23 確認）。普段は不要で、名前がずれたときに手で合わせ直す用。
+> 下の「SessionStart フックとしての登録」も 2.1.309 以降は不要（古い版向けに残してある）。
+
 同じディレクトリの `session_name_sync.py` を呼ぶだけ。**自分で名前を組み立てたり、
 `~/.claude/sessions/*.json` を直接編集したりしないこと。**
 
@@ -89,10 +93,10 @@ Claude Code には名前が **3つ**あり、揃わない:
   無いので、スクリプトは何も出力しない（以前は毎回 `SESSION_NAME_UNKNOWN` が会話に流れていた）。
   `resume` / `clear` / `compact` では従来どおり結果を出す
 
-## SessionStart フックとしての登録と出力
+## SessionStart フックとしての登録と出力（2.1.308 以前向け）
 
 `~/.claude/settings.json` に登録して、起動・resume・clear・compact のたびに自動で同期する
-（手順と、結果を VSCode で表示させる設定はリポジトリの `docs/SETUP.md`）:
+（2.1.309 以降は本体が名前を戻すので登録しない）:
 
 ```json
 "hooks": {

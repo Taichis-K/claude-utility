@@ -47,13 +47,13 @@ AI が探索で読みにいく範囲から読む必要のないものを外し�
 
 - [skills/context-declutter/SKILL.md](skills/context-declutter/SKILL.md)
 
-### `sync-vs-name`(スキル + フック)
+### `sync-vs-name`(スキル)
 
-セッション名(`/list-agents` に出る名前)は、VSCode を開き直すと自動生成の名前に戻ってしまう。
+セッション名(`/list-agents` に出る名前)は、VSCode を開き直すと自動生成の名前に戻ってしまうことがある。
 このスキルは、セッション名を会話タイトル(VSCode のタブに出ている名前)に合わせ直す。
+Claude Code 2.1.309 以降は本体が名前を戻すので、普段は不要(ずれたときの手動用)。
 
 - [skills/sync-vs-name/SKILL.md](skills/sync-vs-name/SKILL.md)
-- [docs/SETUP.md](docs/SETUP.md#sync-vs-name) — 再開時に自動で同期・報告させる設定(フック登録)
 
 ## 使い方
 
